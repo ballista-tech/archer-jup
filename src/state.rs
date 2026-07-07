@@ -187,6 +187,11 @@ impl MakerBook {
         self.status == MAKER_STATUS_ACTIVE
     }
 
+    pub fn is_authorized(&self, signer: &Pubkey) -> bool {
+        self.maker == *signer
+            || (self.delegate != Pubkey::default() && self.delegate == *signer)
+    }
+
     pub fn is_limit_order(&self) -> bool {
         self.kind == MAKER_KIND_LO
     }

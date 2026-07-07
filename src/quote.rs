@@ -356,7 +356,7 @@ pub fn has_matching_liquidity(
             continue;
         }
         if let Some(taker) = taker {
-            if &book.maker == taker {
+            if book.is_authorized(taker) {
                 continue;
             }
         }
@@ -395,7 +395,7 @@ fn collect_all_levels(
         }
 
         if let Some(taker) = taker {
-            if &book.maker == taker {
+            if book.is_authorized(taker) {
                 continue;
             }
         }
@@ -694,6 +694,51 @@ mod tests {
         assert!(!has_matching_liquidity(&books, true, false, 0, Some(&taker)));
         let other = Pubkey::new_unique();
         assert!(has_matching_liquidity(&books, true, false, 0, Some(&other)));
+    }
+
+    #[test]
+    fn test_has_matching_liquidity_skips_delegate_self_trade() {
+        // The matching engine skips a book when the taker is its delegate
+        // (v1 `is_authorized`), not only when the taker is the maker.
+        let maker = Pubkey::new_unique();
+        let delegate = Pubkey::new_unique();
+        let mut book = empty_book(true);
+        book.maker = maker;
+        book.delegate = delegate;
+        book.ask_levels[0] = MakerLevel {
+            size_in_base_lots: 10,
+            price_offset_ticks: 5,
+        };
+        let books = vec![(Pubkey::new_unique(), book)];
+
+        assert!(has_matching_liquidity(&books, true, false, 0, None));
+        let other = Pubkey::new_unique();
+        assert!(has_matching_liquidity(&books, true, false, 0, Some(&other)));
+        assert!(!has_matching_liquidity(&books, true, false, 0, Some(&maker)));
+        assert!(!has_matching_liquidity(&books, true, false, 0, Some(&delegate)));
+    }
+
+    #[test]
+    fn test_default_delegate_is_not_treated_as_taker() {
+        // A book with no delegate (default pubkey) must not accidentally exclude
+        // a taker whose key happens to be the default pubkey.
+        let mut book = empty_book(true);
+        book.maker = Pubkey::new_unique();
+        book.delegate = Pubkey::default();
+        book.ask_levels[0] = MakerLevel {
+            size_in_base_lots: 10,
+            price_offset_ticks: 5,
+        };
+        let books = vec![(Pubkey::new_unique(), book)];
+
+        let default_taker = Pubkey::default();
+        assert!(has_matching_liquidity(
+            &books,
+            true,
+            false,
+            0,
+            Some(&default_taker)
+        ));
     }
 
     #[test]

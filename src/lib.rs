@@ -154,7 +154,13 @@ impl Amm for ArcherAmm {
                 let registry = deserialize_registry(data)
                     .map_err(|e| AmmError::Custom(format!("Failed to deserialize registry: {e}")))?;
                 let num = registry.num_makers as usize;
-                self.maker_book_keys = registry.makers[..num].to_vec();
+                let mut deduped: Vec<Pubkey> = Vec::with_capacity(num);
+                for key in &registry.makers[..num] {
+                    if !deduped.contains(key) {
+                        deduped.push(*key);
+                    }
+                }
+                self.maker_book_keys = deduped;
             }
         }
 
