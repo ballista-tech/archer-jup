@@ -10,9 +10,6 @@ pub const REGISTRY_DISCRIMINATOR: &[u8; 8] = b"ACHRREG1";
 pub const PPM_DIVISOR: u64 = 1_000_000;
 
 pub const MARKET_STATUS_ACTIVE: u8 = 0;
-pub const MARKET_MODE_CONTINUOUS: u8 = 0;
-pub const MARKET_MODE_ASYNC: u8 = 1;
-pub const MARKET_MODE_HYBRID: u8 = 2;
 
 pub const MAKER_STATUS_ACTIVE: u8 = 1;
 
@@ -43,12 +40,9 @@ pub struct MarketStateHeader {
     pub base_decimals: u8,
     pub quote_decimals: u8,
     pub status: u8,
-    pub mode: u8,
+    pub _reserved_padding_1: u8,
     pub market_bump: u8,
-    pub sync_fee_multiplier: u8,
-    pub min_async_delay_slots: u16,
-    pub max_async_delay_slots: u16,
-    pub _reserved: u32,
+    pub _reserved_padding_2: [u8; 11],
 }
 
 unsafe impl Pod for MarketStateHeader {}
@@ -59,32 +53,6 @@ impl MarketStateHeader {
 
     pub fn is_active(&self) -> bool {
         self.status == MARKET_STATUS_ACTIVE
-    }
-
-    pub fn is_hybrid(&self) -> bool {
-        self.mode == MARKET_MODE_HYBRID
-    }
-
-    pub fn is_async_only(&self) -> bool {
-        self.mode == MARKET_MODE_ASYNC
-    }
-
-    pub fn effective_sync_fee_multiplier(&self) -> u8 {
-        if self.sync_fee_multiplier == 0 {
-            1
-        } else {
-            self.sync_fee_multiplier
-        }
-    }
-
-    pub fn sync_taker_fee_ppm(&self) -> Result<i32, ArcherAmmError> {
-        if !self.is_hybrid() {
-            return Ok(self.taker_fee_ppm);
-        }
-        let multiplier = self.effective_sync_fee_multiplier() as i32;
-        self.taker_fee_ppm
-            .checked_mul(multiplier)
-            .ok_or_else(|| ArcherAmmError::MathError("sync fee overflow".into()))
     }
 
     pub fn base_atoms_per_base_unit(&self) -> Result<u128, ArcherAmmError> {
@@ -163,9 +131,10 @@ pub struct MakerBook {
     pub base_free: u64,
     pub status: u8,
     pub maker_book_bump: u8,
-    pub sync_spread_ticks: u16,
+    pub _reserved_padding_1: u16,
     pub kind: u8,
-    pub _status_padding: [u8; 3],
+    pub maker_is_archer_account: u8,
+    pub _reserved_padding_2: [u8; 2],
     pub last_updated_sequence_number: u64,
     pub total_bid_base_lots: u64,
     pub tick_conversion_num: u64,
@@ -174,7 +143,8 @@ pub struct MakerBook {
     pub ask_levels: [MakerLevel; MAX_LEVELS],
     pub last_updated_slot: u64,
     pub expiry_in_slots: u64,
-    pub _reserved: [u64; 6],
+    pub mid_at_last_sync: u64,
+    pub _reserved: [u64; 5],
 }
 
 unsafe impl Pod for MakerBook {}
@@ -199,6 +169,39 @@ impl MakerBook {
     pub fn is_stale(&self, current_slot: u64) -> bool {
         self.expiry_in_slots > 0
             && current_slot.saturating_sub(self.last_updated_slot) >= self.expiry_in_slots
+    }
+
+    pub fn projected_quote_balances(&self) -> Option<(u64, u64)> {
+        let cur = self.mid_price_ticks;
+        let anchor = self.mid_at_last_sync;
+
+        if anchor == 0 || anchor == cur {
+            return Some((self.quote_locked, self.quote_free));
+        }
+
+        let (delta_price, is_increase) = if cur > anchor {
+            (cur - anchor, true)
+        } else {
+            (anchor - cur, false)
+        };
+
+        let quote_delta = self.quote_delta_per_tick.checked_mul(delta_price)?;
+
+        if is_increase {
+            Some((
+                self.quote_locked.checked_add(quote_delta)?,
+                self.quote_free.checked_sub(quote_delta)?,
+            ))
+        } else {
+            Some((
+                self.quote_locked.checked_sub(quote_delta)?,
+                self.quote_free.checked_add(quote_delta)?,
+            ))
+        }
+    }
+
+    pub fn is_quote_sync_fundable(&self) -> bool {
+        self.projected_quote_balances().is_some()
     }
 }
 

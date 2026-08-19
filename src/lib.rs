@@ -48,8 +48,8 @@ pub struct ArcherAmm {
 
     pub clock_ref: ClockRef,
 
-    /// Quote token account that receives the integrator's share of taker fees.
-    pub integrator_fee_wallet: Pubkey,
+    /// Quote token account that receives the builder fee, when one is charged.
+    pub builder_fee_wallet: Pubkey,
 }
 
 impl ArcherAmm {
@@ -95,7 +95,7 @@ impl Amm for ArcherAmm {
             base_mint_data: vec![],
             quote_mint_data: vec![],
             clock_ref: amm_context.clock_ref.clone(),
-            integrator_fee_wallet: Pubkey::default(),
+            builder_fee_wallet: Pubkey::default(),
         })
     }
 
@@ -236,7 +236,7 @@ impl Amm for ArcherAmm {
             transfer_fee_atoms(output_mint_data, output_token_program, out_amount, current_epoch)?;
         let net_output = out_amount.saturating_sub(output_transfer_fee);
 
-        let effective_fee_ppm = header.sync_taker_fee_ppm().unwrap_or(header.taker_fee_ppm);
+        let effective_fee_ppm = header.taker_fee_ppm;
         let fee_pct = if effective_fee_ppm != 0 {
             Decimal::new(effective_fee_ppm as i64, 6)
         } else {
@@ -279,7 +279,7 @@ impl Amm for ArcherAmm {
         let mut account_metas = vec![
             AccountMeta::new_readonly(swap_params.token_transfer_authority, true),
             AccountMeta::new(self.market_key, false),
-            AccountMeta::new(self.integrator_fee_wallet, false),
+            AccountMeta::new(self.builder_fee_wallet, false),
             AccountMeta::new_readonly(header.base_mint, false),
             AccountMeta::new_readonly(header.quote_mint, false),
             AccountMeta::new(header.base_vault, false),

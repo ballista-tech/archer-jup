@@ -38,15 +38,9 @@ pub fn compute_quote(
         });
     }
 
-    if header.is_async_only() {
-        return Err(ArcherAmmError::AsyncNotSupported);
-    }
+    let effective_taker_fee_ppm = header.taker_fee_ppm;
 
-    let effective_taker_fee_ppm = header.sync_taker_fee_ppm()?;
-
-    let apply_sync_spread = header.is_hybrid();
-
-    if !has_matching_liquidity(maker_books, is_buy, apply_sync_spread, current_slot, taker) {
+    if !has_matching_liquidity(maker_books, is_buy, current_slot, taker) {
         return Ok(QuoteOutput {
             out_amount: 0,
             fee_amount: 0,
@@ -59,7 +53,6 @@ pub fn compute_quote(
             header,
             maker_books,
             effective_taker_fee_ppm,
-            apply_sync_spread,
             current_slot,
             taker,
         )
@@ -69,7 +62,6 @@ pub fn compute_quote(
             header,
             maker_books,
             effective_taker_fee_ppm,
-            apply_sync_spread,
             current_slot,
             taker,
         )
@@ -81,7 +73,6 @@ fn quote_buy_exact_in(
     header: &MarketStateHeader,
     maker_books: &[(Pubkey, MakerBook)],
     effective_taker_fee_ppm: i32,
-    apply_sync_spread: bool,
     current_slot: u64,
     taker: Option<&Pubkey>,
 ) -> Result<QuoteOutput, ArcherAmmError> {
@@ -111,7 +102,7 @@ fn quote_buy_exact_in(
     };
 
     let mut all_asks =
-        collect_all_levels(maker_books, false, apply_sync_spread, current_slot, taker);
+        collect_all_levels(maker_books, false, current_slot, taker);
 
     all_asks.sort_unstable_by(|a, b| {
         a.price_ticks
@@ -223,7 +214,6 @@ fn quote_sell_exact_in(
     header: &MarketStateHeader,
     maker_books: &[(Pubkey, MakerBook)],
     effective_taker_fee_ppm: i32,
-    apply_sync_spread: bool,
     current_slot: u64,
     taker: Option<&Pubkey>,
 ) -> Result<QuoteOutput, ArcherAmmError> {
@@ -237,7 +227,7 @@ fn quote_sell_exact_in(
     }
 
     let mut all_bids =
-        collect_all_levels(maker_books, true, apply_sync_spread, current_slot, taker);
+        collect_all_levels(maker_books, true, current_slot, taker);
 
     all_bids.sort_unstable_by(|a, b| {
         b.price_ticks
@@ -347,7 +337,6 @@ fn quote_sell_exact_in(
 pub fn has_matching_liquidity(
     maker_books: &[(Pubkey, MakerBook)],
     is_buy: bool,
-    apply_sync_spread: bool,
     current_slot: u64,
     taker: Option<&Pubkey>,
 ) -> bool {
@@ -363,7 +352,7 @@ pub fn has_matching_liquidity(
         if book.is_stale(current_slot) {
             continue;
         }
-        if apply_sync_spread && book.sync_spread_ticks == u16::MAX {
+        if !book.is_quote_sync_fundable() {
             continue;
         }
         let levels = if is_buy {
@@ -383,7 +372,6 @@ pub fn has_matching_liquidity(
 fn collect_all_levels(
     maker_books: &[(Pubkey, MakerBook)],
     is_bid_side: bool,
-    apply_sync_spread: bool,
     current_slot: u64,
     taker: Option<&Pubkey>,
 ) -> Vec<AggregatedLevel> {
@@ -404,16 +392,14 @@ fn collect_all_levels(
             continue;
         }
 
+        if !book.is_quote_sync_fundable() {
+            continue;
+        }
+
         let side_levels = if is_bid_side {
             &book.bid_levels
         } else {
             &book.ask_levels
-        };
-
-        let spread_offset = if apply_sync_spread {
-            book.sync_spread_ticks
-        } else {
-            0
         };
 
         for level in side_levels.iter() {
@@ -426,25 +412,8 @@ fn collect_all_levels(
                 None => continue,
             };
 
-            let effective_price = if spread_offset == 0 || spread_offset == u16::MAX {
-                if spread_offset == u16::MAX {
-                    continue;
-                }
-                abs_price
-            } else if is_bid_side {
-                match abs_price.checked_sub(spread_offset as u64) {
-                    Some(p) if p > 0 => p,
-                    _ => continue,
-                }
-            } else {
-                match abs_price.checked_add(spread_offset as u64) {
-                    Some(p) => p,
-                    None => continue,
-                }
-            };
-
             levels.push(AggregatedLevel {
-                price_ticks: effective_price,
+                price_ticks: abs_price,
                 size_base_lots: level.size_in_base_lots,
                 maker_index: maker_idx,
             });
@@ -627,9 +596,10 @@ mod tests {
             base_free: 0,
             status: if active { MAKER_STATUS_ACTIVE } else { 2 },
             maker_book_bump: 0,
-            sync_spread_ticks: 0,
+            _reserved_padding_1: 0,
             kind: 0,
-            _status_padding: [0; 3],
+            maker_is_archer_account: 0,
+            _reserved_padding_2: [0; 2],
             last_updated_sequence_number: 0,
             total_bid_base_lots: 0,
             tick_conversion_num: 0,
@@ -644,7 +614,8 @@ mod tests {
             }; MAX_LEVELS],
             last_updated_slot: 0,
             expiry_in_slots: 0,
-            _reserved: [0; 6],
+            mid_at_last_sync: 0,
+            _reserved: [0; 5],
         }
     }
 
@@ -656,8 +627,8 @@ mod tests {
             price_offset_ticks: 5,
         };
         let books = vec![(Pubkey::new_unique(), book)];
-        assert!(has_matching_liquidity(&books, true, false, 0, None));
-        assert!(!has_matching_liquidity(&books, false, false, 0, None));
+        assert!(has_matching_liquidity(&books, true, 0, None));
+        assert!(!has_matching_liquidity(&books, false, 0, None));
     }
 
     #[test]
@@ -672,11 +643,11 @@ mod tests {
         let books = vec![(Pubkey::new_unique(), book)];
 
         // Within the expiry window — still liquid.
-        assert!(has_matching_liquidity(&books, true, false, 149, None));
+        assert!(has_matching_liquidity(&books, true, 149, None));
         // Exactly at expiry — stale.
-        assert!(!has_matching_liquidity(&books, true, false, 150, None));
+        assert!(!has_matching_liquidity(&books, true, 150, None));
         // Well past expiry — stale.
-        assert!(!has_matching_liquidity(&books, true, false, 10_000, None));
+        assert!(!has_matching_liquidity(&books, true, 10_000, None));
     }
 
     #[test]
@@ -690,10 +661,10 @@ mod tests {
         };
         let books = vec![(Pubkey::new_unique(), book)];
 
-        assert!(has_matching_liquidity(&books, true, false, 0, None));
-        assert!(!has_matching_liquidity(&books, true, false, 0, Some(&taker)));
+        assert!(has_matching_liquidity(&books, true, 0, None));
+        assert!(!has_matching_liquidity(&books, true, 0, Some(&taker)));
         let other = Pubkey::new_unique();
-        assert!(has_matching_liquidity(&books, true, false, 0, Some(&other)));
+        assert!(has_matching_liquidity(&books, true, 0, Some(&other)));
     }
 
     #[test]
@@ -711,11 +682,11 @@ mod tests {
         };
         let books = vec![(Pubkey::new_unique(), book)];
 
-        assert!(has_matching_liquidity(&books, true, false, 0, None));
+        assert!(has_matching_liquidity(&books, true, 0, None));
         let other = Pubkey::new_unique();
-        assert!(has_matching_liquidity(&books, true, false, 0, Some(&other)));
-        assert!(!has_matching_liquidity(&books, true, false, 0, Some(&maker)));
-        assert!(!has_matching_liquidity(&books, true, false, 0, Some(&delegate)));
+        assert!(has_matching_liquidity(&books, true, 0, Some(&other)));
+        assert!(!has_matching_liquidity(&books, true, 0, Some(&maker)));
+        assert!(!has_matching_liquidity(&books, true, 0, Some(&delegate)));
     }
 
     #[test]
@@ -732,13 +703,7 @@ mod tests {
         let books = vec![(Pubkey::new_unique(), book)];
 
         let default_taker = Pubkey::default();
-        assert!(has_matching_liquidity(
-            &books,
-            true,
-            false,
-            0,
-            Some(&default_taker)
-        ));
+        assert!(has_matching_liquidity(&books, true, 0, Some(&default_taker)));
     }
 
     #[test]
@@ -763,4 +728,95 @@ mod tests {
         assert_eq!(quote_to_base_lots(&header(1), q1, 1, false).unwrap(), 1);
         assert_eq!(quote_to_base_lots(&header(10), q10, 1, false).unwrap(), 1);
     }
+
+    #[test]
+    fn test_has_matching_liquidity_detects_all_suspended() {
+        let mut book = empty_book(false);
+        book.ask_levels[0] = MakerLevel {
+            size_in_base_lots: 10,
+            price_offset_ticks: 5,
+        };
+        let books = vec![(Pubkey::new_unique(), book)];
+        assert!(!has_matching_liquidity(&books, true, 0, None));
+        assert!(!has_matching_liquidity(&books, false, 0, None));
+    }
+
+    #[test]
+    fn test_has_matching_liquidity_detects_active_no_levels() {
+        let book = empty_book(true);
+        let books = vec![(Pubkey::new_unique(), book)];
+        assert!(!has_matching_liquidity(&books, true, 0, None));
+        assert!(!has_matching_liquidity(&books, false, 0, None));
+    }
+
+    /// A maker who repriced further than their free quote can back is dropped
+    /// from the auction on-chain. Quoting their liquidity would overstate what a
+    /// swap can fill, so the adapter must skip them too.
+    #[test]
+    fn test_unfundable_book_is_skipped() {
+        let mut book = empty_book(true);
+        book.ask_levels[0] = MakerLevel {
+            size_in_base_lots: 10,
+            price_offset_ticks: 5,
+        };
+
+        // A pending reprice upward needs `quote_delta_per_tick * delta` moved
+        // from free into locked; here free cannot cover it.
+        book.mid_at_last_sync = 100;
+        book.mid_price_ticks = 200;
+        book.quote_delta_per_tick = 1_000;
+        book.quote_free = 1;
+        book.quote_locked = 0;
+
+        assert!(!book.is_quote_sync_fundable());
+        let books = vec![(Pubkey::new_unique(), book)];
+        assert!(!has_matching_liquidity(&books, true, 0, None));
+        assert!(collect_all_levels(&books, false, 0, None).is_empty());
+    }
+
+    /// Every pre-v2 account reads `0` in `mid_at_last_sync`, which is the
+    /// "already accurate" sentinel — so the skip never fires against the
+    /// currently deployed program and this adapter is safe to ship ahead of it.
+    #[test]
+    fn test_zero_anchor_is_always_fundable() {
+        let mut book = empty_book(true);
+        book.mid_at_last_sync = 0;
+        book.mid_price_ticks = 500_000;
+        book.quote_delta_per_tick = u64::MAX;
+        book.quote_free = 0;
+
+        assert!(book.is_quote_sync_fundable());
+        assert_eq!(book.projected_quote_balances(), Some((0, 0)));
+    }
+
+    /// The replay is total-preserving: it moves quote between locked and free
+    /// without changing the sum.
+    #[test]
+    fn test_projection_preserves_total() {
+        let mut book = empty_book(true);
+        book.mid_at_last_sync = 100;
+        book.quote_delta_per_tick = 10;
+        book.quote_locked = 5_000;
+        book.quote_free = 5_000;
+
+        book.mid_price_ticks = 150;
+        let (l, f) = book.projected_quote_balances().unwrap();
+        assert_eq!(l + f, 10_000);
+        assert_eq!((l, f), (5_500, 4_500));
+
+        book.mid_price_ticks = 50;
+        let (l, f) = book.projected_quote_balances().unwrap();
+        assert_eq!(l + f, 10_000);
+        assert_eq!((l, f), (4_500, 5_500));
+    }
+
+
+    /// The adapter decodes these straight off the wire, so a size change means a
+    /// silent misread of every account. v2 deliberately preserved both.
+    #[test]
+    fn layout_sizes_match_the_program() {
+        assert_eq!(core::mem::size_of::<MakerBook>(), 776, "MakerBook must stay 776 bytes");
+        assert_eq!(core::mem::size_of::<MarketStateHeader>(), 272, "header must stay 272 bytes");
+    }
+
 }

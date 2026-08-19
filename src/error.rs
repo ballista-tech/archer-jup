@@ -14,9 +14,6 @@ pub enum ArcherAmmError {
     #[error("Market not active")]
     MarketNotActive,
 
-    #[error("Async swap not supported")]
-    AsyncNotSupported,
-
     #[error("No matching liquidity")]
     NoMatchingLiquidity,
 }
