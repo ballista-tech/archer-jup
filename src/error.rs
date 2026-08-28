@@ -17,3 +17,9 @@ pub enum ArcherAmmError {
     #[error("No matching liquidity")]
     NoMatchingLiquidity,
 }
+
+impl From<archer_sdk::onchain::ArcherError> for ArcherAmmError {
+    fn from(e: archer_sdk::onchain::ArcherError) -> Self {
+        ArcherAmmError::MathError(format!("{e:?}"))
+    }
+}

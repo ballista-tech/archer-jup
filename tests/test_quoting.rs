@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod simulations {
+    use archer_sdk::onchain::ArcherUnit;
     use litesvm::LiteSVM;
     use rand::Rng;
 
@@ -88,9 +89,9 @@ mod simulations {
         let is_buy = *input_mint == header.quote_mint;
 
         let min_lot = if is_buy {
-            header.quote_atoms_per_quote_lot
+            header.quote_atoms_per_quote_lot.as_u64()
         } else {
-            header.base_atoms_per_base_lot
+            header.base_atoms_per_base_lot.as_u64()
         };
 
         let quote_output = |amount: u64| -> u64 {
@@ -350,9 +351,9 @@ mod simulations {
                 let is_buy = input_mint == header.quote_mint;
                 let side: u8 = if is_buy { 0 } else { 1 };
                 let input_lots = if is_buy {
-                    input_amount / header.quote_atoms_per_quote_lot
+                    input_amount / header.quote_atoms_per_quote_lot.as_u64()
                 } else {
-                    input_amount / header.base_atoms_per_base_lot
+                    input_amount / header.base_atoms_per_base_lot.as_u64()
                 };
                 let mut data = Vec::with_capacity(19);
                 data.push(15u8); // SWAP_DISCRIMINATOR

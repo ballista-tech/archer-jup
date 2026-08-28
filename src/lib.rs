@@ -1,6 +1,5 @@
 pub mod error;
 pub mod quote;
-pub mod state;
 
 use std::sync::atomic::Ordering;
 
@@ -15,10 +14,33 @@ use rust_decimal::Decimal;
 use solana_account::ReadableAccount;
 
 use crate::quote::{compute_quote, QuoteOutput};
-use crate::state::{
-    deserialize_maker_book, deserialize_market_header, deserialize_registry, MakerBook,
-    MarketStateHeader, MARKET_DISCRIMINATOR,
-};
+use archer_sdk::onchain::ArcherUnit;
+use archer_sdk::onchain::{MakerBook, MarketStateHeader, MARKET_STATE_DISCRIMINATOR};
+
+mod decode {
+    use super::*;
+    use crate::error::ArcherAmmError;
+    use archer_sdk::accounts;
+    use archer_sdk::onchain::MakerRegistry;
+
+    pub fn market_header(data: &[u8]) -> Result<MarketStateHeader, ArcherAmmError> {
+        accounts::parse_market_state(data)
+            .map(|h| *h)
+            .map_err(|e| ArcherAmmError::DeserializationFailed(e.to_string()))
+    }
+
+    pub fn maker_book(data: &[u8]) -> Result<MakerBook, ArcherAmmError> {
+        accounts::parse_maker_book(data)
+            .map(|b| *b)
+            .map_err(|e| ArcherAmmError::DeserializationFailed(e.to_string()))
+    }
+
+    pub fn registry(data: &[u8]) -> Result<MakerRegistry, ArcherAmmError> {
+        accounts::parse_maker_registry(data)
+            .map(|r| *r)
+            .map_err(|e| ArcherAmmError::DeserializationFailed(e.to_string()))
+    }
+}
 
 pub const ARCHER_PROGRAM_ID: Pubkey =
     solana_pubkey::pubkey!("Archer8kgiavM61GyusMzaaS2ft5sALtNsD1HxkUPMhy");
@@ -75,7 +97,7 @@ impl Amm for ArcherAmm {
         let market_key = keyed_account.key;
         let data = &keyed_account.account.data;
 
-        if data.len() < 8 || &data[0..8] != MARKET_DISCRIMINATOR {
+        if data.len() < 8 || &data[0..8] != MARKET_STATE_DISCRIMINATOR {
             return Err("Not an Archer market".into());
         }
 
@@ -130,7 +152,7 @@ impl Amm for ArcherAmm {
 
     fn update(&mut self, account_provider: impl AccountProvider) -> Result<(), AmmError> {
         if let Some(market_account) = account_provider.get(&self.market_key) {
-            let header = deserialize_market_header(market_account.data())
+            let header = decode::market_header(market_account.data())
                 .map_err(|e| AmmError::Custom(format!("Failed to deserialize market: {e}")))?;
             self.market_header = Some(header);
         }
@@ -148,10 +170,10 @@ impl Amm for ArcherAmm {
 
         if let Some(registry_account) = account_provider.get(&self.registry_key) {
             let data = registry_account.data();
-            if data.len() >= state::MakerRegistry::LEN
-                && &data[0..8] == state::REGISTRY_DISCRIMINATOR
+            if data.len() >= archer_sdk::onchain::MakerRegistry::LEN
+                && &data[0..8] == archer_sdk::onchain::MAKER_REGISTRY_DISCRIMINATOR
             {
-                let registry = deserialize_registry(data)
+                let registry = decode::registry(data)
                     .map_err(|e| AmmError::Custom(format!("Failed to deserialize registry: {e}")))?;
                 let num = registry.num_makers as usize;
                 let mut deduped: Vec<Pubkey> = Vec::with_capacity(num);
@@ -167,7 +189,7 @@ impl Amm for ArcherAmm {
         self.maker_books.clear();
         for book_key in self.maker_book_keys.clone() {
             if let Some(book_account) = account_provider.get(&book_key) {
-                if let Ok(book) = deserialize_maker_book(book_account.data()) {
+                if let Ok(book) = decode::maker_book(book_account.data()) {
                     self.maker_books.push((book_key, book));
                 }
             }
@@ -292,7 +314,7 @@ impl Amm for ArcherAmm {
 
         let current_slot = self.current_slot();
         for (book_key, book) in &self.maker_books {
-            if book.is_active() && !book.is_stale(current_slot) {
+            if !book.is_frozen() && !book.is_stale(current_slot) {
                 account_metas.push(AccountMeta::new(*book_key, false));
             }
         }
@@ -300,12 +322,12 @@ impl Amm for ArcherAmm {
         let input_lots = if is_buy {
             swap_params
                 .in_amount
-                .checked_div(header.quote_atoms_per_quote_lot)
+                .checked_div(header.quote_atoms_per_quote_lot.as_u64())
                 .ok_or_else(|| AmmError::Custom("quote lot size is 0".into()))?
         } else {
             swap_params
                 .in_amount
-                .checked_div(header.base_atoms_per_base_lot)
+                .checked_div(header.base_atoms_per_base_lot.as_u64())
                 .ok_or_else(|| AmmError::Custom("base lot size is 0".into()))?
         };
 

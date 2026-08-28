@@ -1,7 +1,7 @@
 use solana_program::pubkey::Pubkey;
 
 use crate::error::ArcherAmmError;
-use crate::state::{MakerBook, MarketStateHeader, PPM_DIVISOR};
+use archer_sdk::onchain::{ArcherUnit, BaseLots, MakerBook, MarketStateHeader, Ticks, PPM_DIVISOR};
 
 #[derive(Debug, Clone, Copy)]
 struct AggregatedLevel {
@@ -76,7 +76,7 @@ fn quote_buy_exact_in(
     current_slot: u64,
     taker: Option<&Pubkey>,
 ) -> Result<QuoteOutput, ArcherAmmError> {
-    let input_quote_lots = input_quote_atoms / header.quote_atoms_per_quote_lot;
+    let input_quote_lots = input_quote_atoms / header.quote_atoms_per_quote_lot.as_u64();
 
     if input_quote_lots == 0 {
         return Ok(QuoteOutput {
@@ -189,17 +189,17 @@ fn quote_buy_exact_in(
     let taker_fee_lots = calculate_fee(total_quote_lots_matched, effective_taker_fee_ppm)?;
 
     let out_base_atoms = total_base_lots_out
-        .checked_mul(header.base_atoms_per_base_lot)
+        .checked_mul(header.base_atoms_per_base_lot.as_u64())
         .ok_or_else(|| ArcherAmmError::MathError("base atoms overflow".into()))?;
 
     let fee_atoms = if taker_fee_lots >= 0 {
         (taker_fee_lots as u64)
-            .checked_mul(header.quote_atoms_per_quote_lot)
+            .checked_mul(header.quote_atoms_per_quote_lot.as_u64())
             .ok_or_else(|| ArcherAmmError::MathError("fee atoms overflow".into()))?
     } else {
         taker_fee_lots
             .unsigned_abs()
-            .checked_mul(header.quote_atoms_per_quote_lot)
+            .checked_mul(header.quote_atoms_per_quote_lot.as_u64())
             .ok_or_else(|| ArcherAmmError::MathError("fee atoms overflow".into()))?
     };
 
@@ -217,7 +217,7 @@ fn quote_sell_exact_in(
     current_slot: u64,
     taker: Option<&Pubkey>,
 ) -> Result<QuoteOutput, ArcherAmmError> {
-    let input_base_lots = input_base_atoms / header.base_atoms_per_base_lot;
+    let input_base_lots = input_base_atoms / header.base_atoms_per_base_lot.as_u64();
 
     if input_base_lots == 0 {
         return Ok(QuoteOutput {
@@ -314,17 +314,17 @@ fn quote_sell_exact_in(
     };
 
     let out_quote_atoms = net_quote_lots
-        .checked_mul(header.quote_atoms_per_quote_lot)
+        .checked_mul(header.quote_atoms_per_quote_lot.as_u64())
         .ok_or_else(|| ArcherAmmError::MathError("quote atoms overflow".into()))?;
 
     let fee_atoms = if taker_fee_lots >= 0 {
         (taker_fee_lots as u64)
-            .checked_mul(header.quote_atoms_per_quote_lot)
+            .checked_mul(header.quote_atoms_per_quote_lot.as_u64())
             .ok_or_else(|| ArcherAmmError::MathError("fee atoms overflow".into()))?
     } else {
         taker_fee_lots
             .unsigned_abs()
-            .checked_mul(header.quote_atoms_per_quote_lot)
+            .checked_mul(header.quote_atoms_per_quote_lot.as_u64())
             .ok_or_else(|| ArcherAmmError::MathError("fee atoms overflow".into()))?
     };
 
@@ -341,7 +341,7 @@ pub fn has_matching_liquidity(
     taker: Option<&Pubkey>,
 ) -> bool {
     for (_, book) in maker_books {
-        if !book.is_active() {
+        if book.is_frozen() {
             continue;
         }
         if let Some(taker) = taker {
@@ -378,7 +378,7 @@ fn collect_all_levels(
     let mut levels = Vec::new();
 
     for (maker_idx, (_, book)) in maker_books.iter().enumerate() {
-        if !book.is_active() {
+        if book.is_frozen() {
             continue;
         }
 
@@ -414,7 +414,7 @@ fn collect_all_levels(
 
             levels.push(AggregatedLevel {
                 price_ticks: abs_price,
-                size_base_lots: level.size_in_base_lots,
+                size_base_lots: level.size_in_base_lots.as_u64(),
                 maker_index: maker_idx,
             });
         }
@@ -429,10 +429,12 @@ fn base_to_quote_lots(
     price_ticks: u64,
     ceiling: bool,
 ) -> Result<u64, ArcherAmmError> {
-    let quote_atoms = market.base_lots_to_quote_atoms(base_lots, price_ticks)?;
+    let quote_atoms = market
+        .base_lots_to_quote_atoms(BaseLots::new(base_lots), Ticks::new(price_ticks))
+        .map_err(|e| ArcherAmmError::MathError(format!("{e:?}")))?;
 
-    let quote_atoms_u128 = quote_atoms as u128;
-    let quote_atoms_per_lot = market.quote_atoms_per_quote_lot as u128;
+    let quote_atoms_u128 = quote_atoms.as_u64() as u128;
+    let quote_atoms_per_lot = market.quote_atoms_per_quote_lot.as_u64() as u128;
 
     if quote_atoms_per_lot == 0 {
         return Err(ArcherAmmError::MathError("quote_atoms_per_lot is 0".into()));
@@ -469,15 +471,15 @@ fn quote_to_base_lots(
     let base_atoms_per_base_unit = market.base_atoms_per_base_unit()?;
 
     let quote_atoms = (quote_lots as u128)
-        .checked_mul(market.quote_atoms_per_quote_lot as u128)
+        .checked_mul(market.quote_atoms_per_quote_lot.as_u64() as u128)
         .ok_or_else(|| ArcherAmmError::MathError("overflow".into()))?;
 
     let numerator = quote_atoms
         .checked_mul(base_atoms_per_base_unit)
         .ok_or_else(|| ArcherAmmError::MathError("overflow".into()))?;
 
-    let tick_size = market.tick_size_in_quote_atoms_per_base_unit as u128;
-    let base_atoms_per_lot = market.base_atoms_per_base_lot as u128;
+    let tick_size = market.tick_size_in_quote_atoms_per_base_unit.as_u64() as u128;
+    let base_atoms_per_lot = market.base_atoms_per_base_lot.as_u64() as u128;
 
     let denominator = (price_ticks as u128)
         .checked_mul(tick_size)
@@ -560,7 +562,10 @@ fn calculate_fee(quote_lots: u64, fee_ppm: i32) -> Result<i64, ArcherAmmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{MakerLevel, MAKER_STATUS_ACTIVE, MAX_LEVELS};
+    use archer_sdk::onchain::{
+        ArcherUnit, BaseAtomsPerLot, BaseLots, MakerBookStatus, MakerLevel, QuoteAtomsPerBaseUnitPerTick,
+        QuoteAtomsPerLot, QuoteLots, MAX_LEVELS,
+    };
 
     #[test]
     fn test_calculate_fee_positive() {
@@ -590,32 +595,32 @@ mod tests {
             mid_price_ticks: 100,
             quote_delta_per_tick: 0,
             min_mid_price_ticks: 0,
-            quote_locked: 0,
-            quote_free: 0,
-            base_locked: 0,
-            base_free: 0,
-            status: if active { MAKER_STATUS_ACTIVE } else { 2 },
+            quote_locked: QuoteLots::new(0),
+            quote_free: QuoteLots::new(0),
+            base_locked: BaseLots::new(0),
+            base_free: BaseLots::new(0),
+            status: if active { MakerBookStatus::Active.as_u8() } else { MakerBookStatus::Suspended.as_u8() },
             maker_book_bump: 0,
-            _reserved_padding_1: 0,
+            reserved_padding_1: 0,
             kind: 0,
             maker_is_archer_account: 0,
-            _reserved_padding_2: [0; 2],
+            reserved_padding_2: [0; 2],
             last_updated_sequence_number: 0,
-            total_bid_base_lots: 0,
+            total_bid_base_lots: BaseLots::new(0),
             tick_conversion_num: 0,
             tick_conversion_den: 0,
             bid_levels: [MakerLevel {
-                size_in_base_lots: 0,
+                size_in_base_lots: BaseLots::new(0),
                 price_offset_ticks: 0,
             }; MAX_LEVELS],
             ask_levels: [MakerLevel {
-                size_in_base_lots: 0,
+                size_in_base_lots: BaseLots::new(0),
                 price_offset_ticks: 0,
             }; MAX_LEVELS],
             last_updated_slot: 0,
             expiry_in_slots: 0,
             mid_at_last_sync: 0,
-            _reserved: [0; 5],
+            reserved_padding_3: [0; 5],
         }
     }
 
@@ -623,7 +628,7 @@ mod tests {
     fn test_has_matching_liquidity_detects_active_with_levels() {
         let mut book = empty_book(true);
         book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: 10,
+            size_in_base_lots: BaseLots::new(10),
             price_offset_ticks: 5,
         };
         let books = vec![(Pubkey::new_unique(), book)];
@@ -635,7 +640,7 @@ mod tests {
     fn test_has_matching_liquidity_skips_stale_book() {
         let mut book = empty_book(true);
         book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: 10,
+            size_in_base_lots: BaseLots::new(10),
             price_offset_ticks: 5,
         };
         book.last_updated_slot = 100;
@@ -656,7 +661,7 @@ mod tests {
         let mut book = empty_book(true);
         book.maker = taker;
         book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: 10,
+            size_in_base_lots: BaseLots::new(10),
             price_offset_ticks: 5,
         };
         let books = vec![(Pubkey::new_unique(), book)];
@@ -677,7 +682,7 @@ mod tests {
         book.maker = maker;
         book.delegate = delegate;
         book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: 10,
+            size_in_base_lots: BaseLots::new(10),
             price_offset_ticks: 5,
         };
         let books = vec![(Pubkey::new_unique(), book)];
@@ -697,7 +702,7 @@ mod tests {
         book.maker = Pubkey::new_unique();
         book.delegate = Pubkey::default();
         book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: 10,
+            size_in_base_lots: BaseLots::new(10),
             price_offset_ticks: 5,
         };
         let books = vec![(Pubkey::new_unique(), book)];
@@ -713,27 +718,27 @@ mod tests {
         fn header(raw: u64) -> MarketStateHeader {
             let mut h = MarketStateHeader::zeroed();
             h.base_decimals = 6;
-            h.base_atoms_per_base_lot = 1_000_000;
-            h.tick_size_in_quote_atoms_per_base_unit = 1_000_000;
-            h.quote_atoms_per_quote_lot = 1;
+            h.base_atoms_per_base_lot = BaseAtomsPerLot::new(1_000_000);
+            h.tick_size_in_quote_atoms_per_base_unit = QuoteAtomsPerBaseUnitPerTick::new(1_000_000);
+            h.quote_atoms_per_quote_lot = QuoteAtomsPerLot::new(1);
             h.raw_base_units_per_base_unit = raw;
             h
         }
 
-        let q1 = header(1).base_lots_to_quote_atoms(1, 1).unwrap();
-        let q10 = header(10).base_lots_to_quote_atoms(1, 1).unwrap();
-        assert_eq!(q1, 1_000_000);
-        assert_eq!(q10, 100_000);
+        let q1 = header(1).base_lots_to_quote_atoms(BaseLots::new(1), Ticks::new(1)).unwrap();
+        let q10 = header(10).base_lots_to_quote_atoms(BaseLots::new(1), Ticks::new(1)).unwrap();
+        assert_eq!(q1.as_u64(), 1_000_000);
+        assert_eq!(q10.as_u64(), 100_000);
 
-        assert_eq!(quote_to_base_lots(&header(1), q1, 1, false).unwrap(), 1);
-        assert_eq!(quote_to_base_lots(&header(10), q10, 1, false).unwrap(), 1);
+        assert_eq!(quote_to_base_lots(&header(1), q1.as_u64(), 1, false).unwrap(), 1);
+        assert_eq!(quote_to_base_lots(&header(10), q10.as_u64(), 1, false).unwrap(), 1);
     }
 
     #[test]
     fn test_has_matching_liquidity_detects_all_suspended() {
         let mut book = empty_book(false);
         book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: 10,
+            size_in_base_lots: BaseLots::new(10),
             price_offset_ticks: 5,
         };
         let books = vec![(Pubkey::new_unique(), book)];
@@ -756,7 +761,7 @@ mod tests {
     fn test_unfundable_book_is_skipped() {
         let mut book = empty_book(true);
         book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: 10,
+            size_in_base_lots: BaseLots::new(10),
             price_offset_ticks: 5,
         };
 
@@ -765,8 +770,8 @@ mod tests {
         book.mid_at_last_sync = 100;
         book.mid_price_ticks = 200;
         book.quote_delta_per_tick = 1_000;
-        book.quote_free = 1;
-        book.quote_locked = 0;
+        book.quote_free = QuoteLots::new(1);
+        book.quote_locked = QuoteLots::new(0);
 
         assert!(!book.is_quote_sync_fundable());
         let books = vec![(Pubkey::new_unique(), book)];
@@ -783,10 +788,10 @@ mod tests {
         book.mid_at_last_sync = 0;
         book.mid_price_ticks = 500_000;
         book.quote_delta_per_tick = u64::MAX;
-        book.quote_free = 0;
+        book.quote_free = QuoteLots::new(0);
 
         assert!(book.is_quote_sync_fundable());
-        assert_eq!(book.projected_quote_balances(), Some((0, 0)));
+        assert_eq!(book.projected_quote_balances().ok(), Some((0, 0)));
     }
 
     /// The replay is total-preserving: it moves quote between locked and free
@@ -796,8 +801,8 @@ mod tests {
         let mut book = empty_book(true);
         book.mid_at_last_sync = 100;
         book.quote_delta_per_tick = 10;
-        book.quote_locked = 5_000;
-        book.quote_free = 5_000;
+        book.quote_locked = QuoteLots::new(5_000);
+        book.quote_free = QuoteLots::new(5_000);
 
         book.mid_price_ticks = 150;
         let (l, f) = book.projected_quote_balances().unwrap();

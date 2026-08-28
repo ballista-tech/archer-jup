@@ -5,6 +5,7 @@ edition = "2024"
 description = "Archer AMM integration for Jupiter aggregator"
 
 [dependencies]
+archer-sdk = { git = "https://github.com/ballista-tech/archer-sdk", rev = "6d80857" }
 jupiter-amm-interface = { path = "jupiter-amm-interface" }
 solana-pubkey = "2.2.1"
 solana-program = "2.2.1"

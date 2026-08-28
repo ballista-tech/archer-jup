@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod test_construction {
+    use archer_sdk::onchain::ArcherUnit;
     use std::collections::HashMap;
     use std::env;
     use std::str::FromStr;
@@ -34,9 +35,9 @@ mod test_construction {
         let is_buy = *input_mint == header.quote_mint;
 
         let min_lot = if is_buy {
-            header.quote_atoms_per_quote_lot
+            header.quote_atoms_per_quote_lot.as_u64()
         } else {
-            header.base_atoms_per_base_lot
+            header.base_atoms_per_base_lot.as_u64()
         };
 
         let quote_output = |amount: u64| -> u64 {
