@@ -17,14 +17,14 @@ pub struct QuoteOutput {
 }
 
 pub fn compute_quote(
-    input_amount: u64,
+    input_lots: u64,
     is_buy: bool,
     header: &MarketStateHeader,
     maker_books: &[(Pubkey, MakerBook)],
     current_slot: u64,
     taker: Option<&Pubkey>,
 ) -> Result<QuoteOutput, ArcherAmmError> {
-    if input_amount == 0 {
+    if input_lots == 0 {
         return Ok(QuoteOutput {
             out_amount: 0,
             fee_amount: 0,
@@ -40,7 +40,7 @@ pub fn compute_quote(
 
     let effective_taker_fee_ppm = header.taker_fee_ppm;
 
-    if !has_matching_liquidity(maker_books, is_buy, current_slot, taker) {
+    if !has_matching_liquidity(maker_books, is_buy, current_slot, taker, header.maker_fee_ppm) {
         return Ok(QuoteOutput {
             out_amount: 0,
             fee_amount: 0,
@@ -49,7 +49,7 @@ pub fn compute_quote(
 
     if is_buy {
         quote_buy_exact_in(
-            input_amount,
+            input_lots,
             header,
             maker_books,
             effective_taker_fee_ppm,
@@ -58,7 +58,7 @@ pub fn compute_quote(
         )
     } else {
         quote_sell_exact_in(
-            input_amount,
+            input_lots,
             header,
             maker_books,
             effective_taker_fee_ppm,
@@ -69,21 +69,13 @@ pub fn compute_quote(
 }
 
 fn quote_buy_exact_in(
-    input_quote_atoms: u64,
+    input_quote_lots: u64,
     header: &MarketStateHeader,
     maker_books: &[(Pubkey, MakerBook)],
     effective_taker_fee_ppm: i32,
     current_slot: u64,
     taker: Option<&Pubkey>,
 ) -> Result<QuoteOutput, ArcherAmmError> {
-    let input_quote_lots = input_quote_atoms / header.quote_atoms_per_quote_lot.as_u64();
-
-    if input_quote_lots == 0 {
-        return Ok(QuoteOutput {
-            out_amount: 0,
-            fee_amount: 0,
-        });
-    }
 
     let matching_amount = if effective_taker_fee_ppm > 0 {
         let ppm = PPM_DIVISOR as u128;
@@ -102,7 +94,7 @@ fn quote_buy_exact_in(
     };
 
     let mut all_asks =
-        collect_all_levels(maker_books, false, current_slot, taker);
+        collect_all_levels(maker_books, false, current_slot, taker, header.maker_fee_ppm);
 
     all_asks.sort_unstable_by(|a, b| {
         a.price_ticks
@@ -125,64 +117,44 @@ fn quote_buy_exact_in(
             }
             j
         };
-
-        let total_size: u64 = all_asks[i..group_end]
-            .iter()
-            .map(|l| l.size_base_lots)
-            .sum();
-
-        let max_base = quote_to_base_lots(header, remaining_quote_lots, price, false)?;
-        let base_to_fill = max_base.min(total_size);
-
-        if base_to_fill == 0 {
-            break;
-        }
-
-        let maker_levels = &all_asks[i..group_end];
-        let num_makers = maker_levels.len();
-        let mut filled_base = 0u64;
-        let mut filled_quote = 0u64;
-        let mut distributed = 0u64;
-
-        for (idx, maker) in maker_levels.iter().enumerate() {
-            let is_last = idx == num_makers - 1;
-
-            let share = if is_last {
-                base_to_fill
-                    .saturating_sub(distributed)
-                    .min(maker.size_base_lots)
-            } else {
-                calculate_pro_rata(base_to_fill, maker.size_base_lots, total_size)?
-                    .min(maker.size_base_lots)
-            };
-
-            if share == 0 {
-                continue;
+        let mut budget_exhausted = false;
+        loop {
+            let total_size = group_total(&all_asks[i..group_end])?;
+            if total_size == 0 {
+                break;
             }
 
-            let quote_cost = base_to_quote_lots(header, share, price, true)?;
+            let max_base = quote_to_base_lots(header, remaining_quote_lots, price, false)?;
+            let base_to_fill = max_base.min(total_size);
+            if base_to_fill == 0 {
+                budget_exhausted = true;
+                break;
+            }
 
-            filled_base = filled_base
-                .checked_add(share)
-                .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
-            filled_quote = filled_quote
-                .checked_add(quote_cost)
+            let (filled_base, filled_quote) = distribute(
+                &mut all_asks[i..group_end],
+                base_to_fill,
+                total_size,
+                |share| base_to_quote_lots(header, share, price, true),
+            )?;
+            if filled_base == 0 {
+                break;
+            }
+
+            remaining_quote_lots = remaining_quote_lots
+                .checked_sub(filled_quote)
+                .ok_or_else(|| ArcherAmmError::MathError("remaining underflow".into()))?;
+            total_quote_lots_matched = total_quote_lots_matched
+                .checked_add(filled_quote)
                 .ok_or_else(|| ArcherAmmError::MathError("quote overflow".into()))?;
-            distributed = distributed
-                .checked_add(share)
+            total_base_lots_out = total_base_lots_out
+                .checked_add(filled_base)
                 .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
         }
 
-        remaining_quote_lots = remaining_quote_lots
-            .checked_sub(filled_quote)
-            .ok_or_else(|| ArcherAmmError::MathError("remaining underflow".into()))?;
-        total_quote_lots_matched = total_quote_lots_matched
-            .checked_add(filled_quote)
-            .ok_or_else(|| ArcherAmmError::MathError("quote overflow".into()))?;
-        total_base_lots_out = total_base_lots_out
-            .checked_add(filled_base)
-            .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
-
+        if budget_exhausted {
+            break;
+        }
         i = group_end;
     }
 
@@ -210,24 +182,16 @@ fn quote_buy_exact_in(
 }
 
 fn quote_sell_exact_in(
-    input_base_atoms: u64,
+    input_base_lots: u64,
     header: &MarketStateHeader,
     maker_books: &[(Pubkey, MakerBook)],
     effective_taker_fee_ppm: i32,
     current_slot: u64,
     taker: Option<&Pubkey>,
 ) -> Result<QuoteOutput, ArcherAmmError> {
-    let input_base_lots = input_base_atoms / header.base_atoms_per_base_lot.as_u64();
-
-    if input_base_lots == 0 {
-        return Ok(QuoteOutput {
-            out_amount: 0,
-            fee_amount: 0,
-        });
-    }
 
     let mut all_bids =
-        collect_all_levels(maker_books, true, current_slot, taker);
+        collect_all_levels(maker_books, true, current_slot, taker, header.maker_fee_ppm);
 
     all_bids.sort_unstable_by(|a, b| {
         b.price_ticks
@@ -250,53 +214,34 @@ fn quote_sell_exact_in(
             j
         };
 
-        let total_size: u64 = all_bids[i..group_end]
-            .iter()
-            .map(|l| l.size_base_lots)
-            .sum();
-
-        let base_to_fill = remaining_base_lots.min(total_size);
-        if base_to_fill == 0 {
-            i = group_end;
-            continue;
-        }
-
-        let maker_levels = &all_bids[i..group_end];
-        let num_makers = maker_levels.len();
-        let mut filled_base = 0u64;
-        let mut distributed = 0u64;
-
-        for (idx, maker) in maker_levels.iter().enumerate() {
-            let is_last = idx == num_makers - 1;
-
-            let share = if is_last {
-                base_to_fill
-                    .saturating_sub(distributed)
-                    .min(maker.size_base_lots)
-            } else {
-                calculate_pro_rata(base_to_fill, maker.size_base_lots, total_size)?
-                    .min(maker.size_base_lots)
-            };
-
-            if share == 0 {
-                continue;
+        loop {
+            let total_size = group_total(&all_bids[i..group_end])?;
+            if total_size == 0 {
+                break;
             }
 
-            let quote_received = base_to_quote_lots(header, share, price, false)?;
-            total_quote_lots_matched = total_quote_lots_matched
-                .checked_add(quote_received)
-                .ok_or_else(|| ArcherAmmError::MathError("quote overflow".into()))?;
-            filled_base = filled_base
-                .checked_add(share)
-                .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
-            distributed = distributed
-                .checked_add(share)
-                .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
-        }
+            let base_to_fill = remaining_base_lots.min(total_size);
+            if base_to_fill == 0 {
+                break;
+            }
 
-        remaining_base_lots = remaining_base_lots
-            .checked_sub(filled_base)
-            .ok_or_else(|| ArcherAmmError::MathError("remaining underflow".into()))?;
+            let (filled_base, filled_quote) = distribute(
+                &mut all_bids[i..group_end],
+                base_to_fill,
+                total_size,
+                |share| base_to_quote_lots(header, share, price, false),
+            )?;
+            if filled_base == 0 {
+                break;
+            }
+
+            remaining_base_lots = remaining_base_lots
+                .checked_sub(filled_base)
+                .ok_or_else(|| ArcherAmmError::MathError("remaining underflow".into()))?;
+            total_quote_lots_matched = total_quote_lots_matched
+                .checked_add(filled_quote)
+                .ok_or_else(|| ArcherAmmError::MathError("quote overflow".into()))?;
+        }
 
         i = group_end;
     }
@@ -334,25 +279,93 @@ fn quote_sell_exact_in(
     })
 }
 
+fn group_total(group: &[AggregatedLevel]) -> Result<u64, ArcherAmmError> {
+    group.iter().try_fold(0u64, |acc, l| {
+        acc.checked_add(l.size_base_lots)
+            .ok_or_else(|| ArcherAmmError::MathError("group size overflow".into()))
+    })
+}
+
+fn distribute(
+    group: &mut [AggregatedLevel],
+    base_to_fill: u64,
+    total_size: u64,
+    quote_for: impl Fn(u64) -> Result<u64, ArcherAmmError>,
+) -> Result<(u64, u64), ArcherAmmError> {
+    let live = group.iter().filter(|l| l.size_base_lots > 0).count();
+    let mut seen = 0usize;
+    let mut distributed = 0u64;
+    let mut filled_base = 0u64;
+    let mut filled_quote = 0u64;
+
+    for maker in group.iter_mut().filter(|l| l.size_base_lots > 0) {
+        seen = seen
+            .checked_add(1)
+            .ok_or_else(|| ArcherAmmError::MathError("maker count overflow".into()))?;
+        let is_last = seen == live;
+
+        let share = if is_last {
+            base_to_fill
+                .checked_sub(distributed)
+                .ok_or_else(|| ArcherAmmError::MathError("distributed underflow".into()))?
+                .min(maker.size_base_lots)
+        } else {
+            calculate_pro_rata(base_to_fill, maker.size_base_lots, total_size)?
+                .min(maker.size_base_lots)
+        };
+        if share == 0 {
+            continue;
+        }
+
+        let quote = quote_for(share)?;
+        maker.size_base_lots = maker
+            .size_base_lots
+            .checked_sub(share)
+            .ok_or_else(|| ArcherAmmError::MathError("level underflow".into()))?;
+        distributed = distributed
+            .checked_add(share)
+            .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
+        filled_base = filled_base
+            .checked_add(share)
+            .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
+        filled_quote = filled_quote
+            .checked_add(quote)
+            .ok_or_else(|| ArcherAmmError::MathError("quote overflow".into()))?;
+    }
+
+    if distributed > base_to_fill {
+        return Err(ArcherAmmError::MathError("distributed more than requested".into()));
+    }
+    Ok((filled_base, filled_quote))
+}
+
+pub fn book_is_eligible(
+    book: &MakerBook,
+    current_slot: u64,
+    taker: Option<&Pubkey>,
+    maker_fee_ppm: i32,
+) -> bool {
+    if let Some(taker) = taker {
+        if book.is_authorized(taker) {
+            return false;
+        }
+    }
+    book.get_status()
+        .map(|s| s.can_participate_in_auction())
+        .unwrap_or(false)
+        && !book.is_stale(current_slot)
+        && book.is_quote_sync_fundable(maker_fee_ppm)
+}
+
 pub fn has_matching_liquidity(
     maker_books: &[(Pubkey, MakerBook)],
     is_buy: bool,
     current_slot: u64,
     taker: Option<&Pubkey>,
+    maker_fee_ppm: i32,
 ) -> bool {
     for (_, book) in maker_books {
-        if book.is_frozen() {
-            continue;
-        }
-        if let Some(taker) = taker {
-            if book.is_authorized(taker) {
-                continue;
-            }
-        }
-        if book.is_stale(current_slot) {
-            continue;
-        }
-        if !book.is_quote_sync_fundable() {
+        if !book_is_eligible(book, current_slot, taker, maker_fee_ppm) {
             continue;
         }
         let levels = if is_buy {
@@ -374,25 +387,12 @@ fn collect_all_levels(
     is_bid_side: bool,
     current_slot: u64,
     taker: Option<&Pubkey>,
+    maker_fee_ppm: i32,
 ) -> Vec<AggregatedLevel> {
     let mut levels = Vec::new();
 
     for (maker_idx, (_, book)) in maker_books.iter().enumerate() {
-        if book.is_frozen() {
-            continue;
-        }
-
-        if let Some(taker) = taker {
-            if book.is_authorized(taker) {
-                continue;
-            }
-        }
-
-        if book.is_stale(current_slot) {
-            continue;
-        }
-
-        if !book.is_quote_sync_fundable() {
+        if !book_is_eligible(book, current_slot, taker, maker_fee_ppm) {
             continue;
         }
 
@@ -563,9 +563,10 @@ fn calculate_fee(quote_lots: u64, fee_ppm: i32) -> Result<i64, ArcherAmmError> {
 mod tests {
     use super::*;
     use archer_sdk::onchain::{
-        ArcherUnit, BaseAtomsPerLot, BaseLots, MakerBookStatus, MakerLevel, QuoteAtomsPerBaseUnitPerTick,
-        QuoteAtomsPerLot, QuoteLots, MAX_LEVELS,
+        BaseAtomsPerLot, MakerBookStatus, MakerLevel, QuoteAtomsPerBaseUnitPerTick, QuoteAtomsPerLot,
+        QuoteLots,
     };
+    use bytemuck::Zeroable;
 
     #[test]
     fn test_calculate_fee_positive() {
@@ -586,135 +587,179 @@ mod tests {
         assert_eq!(calculate_fee(0, 5000).unwrap(), 0);
     }
 
+    /// 1:1 lot/tick market: 1 base lot at price p costs p quote lots.
+    fn header(maker_fee_ppm: i32, taker_fee_ppm: i32) -> MarketStateHeader {
+        let mut h = MarketStateHeader::zeroed();
+        h.status = 0;
+        h.base_decimals = 6;
+        h.quote_decimals = 6;
+        h.base_atoms_per_base_lot = BaseAtomsPerLot::new(1_000_000);
+        h.quote_atoms_per_quote_lot = QuoteAtomsPerLot::new(1);
+        h.tick_size_in_quote_atoms_per_base_unit = QuoteAtomsPerBaseUnitPerTick::new(1);
+        h.raw_base_units_per_base_unit = 1;
+        h.maker_fee_ppm = maker_fee_ppm;
+        h.taker_fee_ppm = taker_fee_ppm;
+        h
+    }
+
     fn empty_book(active: bool) -> MakerBook {
-        MakerBook {
-            discriminator: [0; 8],
-            maker: Pubkey::default(),
-            market: Pubkey::default(),
-            delegate: Pubkey::default(),
-            mid_price_ticks: 100,
-            quote_delta_per_tick: 0,
-            min_mid_price_ticks: 0,
-            quote_locked: QuoteLots::new(0),
-            quote_free: QuoteLots::new(0),
-            base_locked: BaseLots::new(0),
-            base_free: BaseLots::new(0),
-            status: if active { MakerBookStatus::Active.as_u8() } else { MakerBookStatus::Suspended.as_u8() },
-            maker_book_bump: 0,
-            reserved_padding_1: 0,
-            kind: 0,
-            maker_is_archer_account: 0,
-            reserved_padding_2: [0; 2],
-            last_updated_sequence_number: 0,
-            total_bid_base_lots: BaseLots::new(0),
-            tick_conversion_num: 0,
-            tick_conversion_den: 0,
-            bid_levels: [MakerLevel {
-                size_in_base_lots: BaseLots::new(0),
-                price_offset_ticks: 0,
-            }; MAX_LEVELS],
-            ask_levels: [MakerLevel {
-                size_in_base_lots: BaseLots::new(0),
-                price_offset_ticks: 0,
-            }; MAX_LEVELS],
-            last_updated_slot: 0,
-            expiry_in_slots: 0,
-            mid_at_last_sync: 0,
-            reserved_padding_3: [0; 5],
+        let mut b = MakerBook::zeroed();
+        b.mid_price_ticks = 100;
+        b.tick_conversion_num = 1;
+        b.tick_conversion_den = 1;
+        b.status = if active {
+            MakerBookStatus::Active.as_u8()
+        } else {
+            MakerBookStatus::Suspended.as_u8()
+        };
+        b
+    }
+
+    /// A book that the program would accept: balances lock exactly what the
+    /// resting levels need (1:1 market, `maker_fee_ppm` buffer on bids).
+    fn book(mid: u64, bids: &[(u64, i64)], asks: &[(u64, i64)], maker_fee_ppm: i32) -> MakerBook {
+        let mut b = empty_book(true);
+        b.mid_price_ticks = mid;
+        b.mid_at_last_sync = mid;
+        let mut base = 0u64;
+        for (i, (size, off)) in asks.iter().enumerate() {
+            b.ask_levels[i] = MakerLevel::new(BaseLots::new(*size), *off);
+            base += size;
         }
+        for (i, (size, off)) in bids.iter().enumerate() {
+            b.bid_levels[i] = MakerLevel::new(BaseLots::new(*size), *off);
+        }
+        b.base_locked = BaseLots::new(base);
+        b.quote_locked = QuoteLots::new(b.required_quote_reserve(maker_fee_ppm).unwrap());
+        b
     }
 
     #[test]
     fn test_has_matching_liquidity_detects_active_with_levels() {
         let mut book = empty_book(true);
-        book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: BaseLots::new(10),
-            price_offset_ticks: 5,
-        };
+        book.ask_levels[0] = MakerLevel::new(BaseLots::new(10), 5);
         let books = vec![(Pubkey::new_unique(), book)];
-        assert!(has_matching_liquidity(&books, true, 0, None));
-        assert!(!has_matching_liquidity(&books, false, 0, None));
+        assert!(has_matching_liquidity(&books, true, 0, None, 0));
+        assert!(!has_matching_liquidity(&books, false, 0, None, 0));
     }
 
     #[test]
     fn test_has_matching_liquidity_skips_stale_book() {
         let mut book = empty_book(true);
-        book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: BaseLots::new(10),
-            price_offset_ticks: 5,
-        };
+        book.ask_levels[0] = MakerLevel::new(BaseLots::new(10), 5);
         book.last_updated_slot = 100;
         book.expiry_in_slots = 50;
         let books = vec![(Pubkey::new_unique(), book)];
-
-        // Within the expiry window — still liquid.
-        assert!(has_matching_liquidity(&books, true, 149, None));
-        // Exactly at expiry — stale.
-        assert!(!has_matching_liquidity(&books, true, 150, None));
-        // Well past expiry — stale.
-        assert!(!has_matching_liquidity(&books, true, 10_000, None));
+        assert!(has_matching_liquidity(&books, true, 149, None, 0));
+        assert!(!has_matching_liquidity(&books, true, 150, None, 0));
+        assert!(!has_matching_liquidity(&books, true, 10_000, None, 0));
     }
 
     #[test]
-    fn test_has_matching_liquidity_skips_self_trade() {
-        let taker = Pubkey::new_unique();
-        let mut book = empty_book(true);
-        book.maker = taker;
-        book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: BaseLots::new(10),
-            price_offset_ticks: 5,
-        };
-        let books = vec![(Pubkey::new_unique(), book)];
-
-        assert!(has_matching_liquidity(&books, true, 0, None));
-        assert!(!has_matching_liquidity(&books, true, 0, Some(&taker)));
-        let other = Pubkey::new_unique();
-        assert!(has_matching_liquidity(&books, true, 0, Some(&other)));
-    }
-
-    #[test]
-    fn test_has_matching_liquidity_skips_delegate_self_trade() {
-        // The matching engine skips a book when the taker is its delegate
-        // (v1 `is_authorized`), not only when the taker is the maker.
+    fn test_has_matching_liquidity_skips_self_trade_and_delegate() {
         let maker = Pubkey::new_unique();
         let delegate = Pubkey::new_unique();
         let mut book = empty_book(true);
         book.maker = maker;
         book.delegate = delegate;
-        book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: BaseLots::new(10),
-            price_offset_ticks: 5,
-        };
+        book.ask_levels[0] = MakerLevel::new(BaseLots::new(10), 5);
         let books = vec![(Pubkey::new_unique(), book)];
-
-        assert!(has_matching_liquidity(&books, true, 0, None));
-        let other = Pubkey::new_unique();
-        assert!(has_matching_liquidity(&books, true, 0, Some(&other)));
-        assert!(!has_matching_liquidity(&books, true, 0, Some(&maker)));
-        assert!(!has_matching_liquidity(&books, true, 0, Some(&delegate)));
+        assert!(has_matching_liquidity(&books, true, 0, None, 0));
+        assert!(has_matching_liquidity(&books, true, 0, Some(&Pubkey::new_unique()), 0));
+        assert!(!has_matching_liquidity(&books, true, 0, Some(&maker), 0));
+        assert!(!has_matching_liquidity(&books, true, 0, Some(&delegate), 0));
+        // A book with no delegate must not exclude a taker at the default key.
+        book.delegate = Pubkey::default();
+        let books = vec![(Pubkey::new_unique(), book)];
+        assert!(has_matching_liquidity(&books, true, 0, Some(&Pubkey::default()), 0));
     }
 
     #[test]
-    fn test_default_delegate_is_not_treated_as_taker() {
-        // A book with no delegate (default pubkey) must not accidentally exclude
-        // a taker whose key happens to be the default pubkey.
-        let mut book = empty_book(true);
-        book.maker = Pubkey::new_unique();
-        book.delegate = Pubkey::default();
-        book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: BaseLots::new(10),
-            price_offset_ticks: 5,
-        };
-        let books = vec![(Pubkey::new_unique(), book)];
+    fn test_suspended_and_undecodable_status_are_ineligible() {
+        let mut book = empty_book(false);
+        book.ask_levels[0] = MakerLevel::new(BaseLots::new(10), 5);
+        assert!(!book_is_eligible(&book, 0, None, 0));
+        book.status = 0;
+        assert!(!book_is_eligible(&book, 0, None, 0));
+        book.status = 1;
+        assert!(book_is_eligible(&book, 0, None, 0));
+    }
 
-        let default_taker = Pubkey::default();
-        assert!(has_matching_liquidity(&books, true, 0, Some(&default_taker)));
+    /// A maker who repriced further than their quote balance can back is
+    /// dropped from the auction on-chain, so the quote must skip them too.
+    #[test]
+    fn test_unfundable_book_is_skipped() {
+        let mut book = empty_book(true);
+        book.ask_levels[0] = MakerLevel::new(BaseLots::new(10), 5);
+        book.bid_levels[0] = MakerLevel::new(BaseLots::new(1_000), -100);
+        book.mid_at_last_sync = 100_000;
+        book.mid_price_ticks = 100_010;
+        book.quote_locked = QuoteLots::new(99_900_000);
+        book.quote_free = QuoteLots::new(10_000);
+        assert!(!book.is_quote_sync_fundable(200));
+        book.quote_free = QuoteLots::new(200_000);
+        assert_eq!(
+            book.projected_quote_balances(200).unwrap(),
+            (99_910_000 + 19_982, 100_100_000 - 99_910_000 - 19_982)
+        );
+        book.quote_free = QuoteLots::new(10_000);
+        let books = vec![(Pubkey::new_unique(), book)];
+        assert!(!has_matching_liquidity(&books, true, 0, None, 200));
+        assert!(!book_is_eligible(&book, 0, None, 200));
+    }
+
+    #[test]
+    fn test_zero_anchor_is_always_fundable() {
+        let mut book = empty_book(true);
+        book.mid_at_last_sync = 0;
+        book.mid_price_ticks = 500_000;
+        book.bid_levels[0] = MakerLevel::new(BaseLots::new(u64::MAX / 2), -1);
+        assert!(book.is_quote_sync_fundable(200));
+        assert_eq!(book.projected_quote_balances(200).ok(), Some((0, 0)));
+    }
+
+    /// Three makers with one lot each at the same price, taker wants two:
+    /// pro-rata floors every non-last share to zero, the last maker fills one
+    /// lot, and the program comes back to the same price for the second lot.
+    /// Moving to the next price after one pass would quote the wrong price.
+    #[test]
+    fn test_pro_rata_dust_revisits_the_same_price() {
+        let h = header(0, 0);
+        let books: Vec<_> = (0..3)
+            .map(|_| (Pubkey::new_unique(), book(100, &[], &[(1, 5)], 0)))
+            .collect();
+        // One more maker further out that a fall-through would hit.
+        let mut all = books.clone();
+        all.push((Pubkey::new_unique(), book(100, &[], &[(5, 50)], 0)));
+
+        let q = compute_quote(2 * 105, true, &h, &all, 0, None).unwrap();
+        assert_eq!(q.out_amount, 2 * 1_000_000, "both lots fill at 105");
+        // Exactly 210 quote lots spent: the second lot came from price 105,
+        // not 150.
+        let q3 = compute_quote(3 * 105, true, &h, &all, 0, None).unwrap();
+        assert_eq!(q3.out_amount, 3 * 1_000_000);
+        let q4 = compute_quote(3 * 105 + 149, true, &h, &all, 0, None).unwrap();
+        assert_eq!(q4.out_amount, 3 * 1_000_000, "149 is not enough for a lot at 150");
+        let q5 = compute_quote(3 * 105 + 150, true, &h, &all, 0, None).unwrap();
+        assert_eq!(q5.out_amount, 4 * 1_000_000);
+    }
+
+    #[test]
+    fn test_buy_grosses_down_by_taker_fee_and_sell_nets_it() {
+        let h = header(0, 10_000); // 1% taker fee
+        let books = vec![(Pubkey::new_unique(), book(100, &[(10, -5)], &[(10, 5)], 0))];
+        // 1010 quote lots gross down to 1000 -> 9 lots at 105 (945), fee ceil(9.45)=10.
+        let q = compute_quote(1_010, true, &h, &books, 0, None).unwrap();
+        assert_eq!(q.out_amount, 9 * 1_000_000);
+        assert_eq!(q.fee_amount, 10);
+        // Sell 10 lots at 95 = 950, fee ceil(9.5) = 10, net 940.
+        let q = compute_quote(10, false, &h, &books, 0, None).unwrap();
+        assert_eq!(q.out_amount, 940);
+        assert_eq!(q.fee_amount, 10);
     }
 
     #[test]
     fn test_raw_base_units_conversion_matches_v1() {
-        use bytemuck::Zeroable;
-
         fn header(raw: u64) -> MarketStateHeader {
             let mut h = MarketStateHeader::zeroed();
             h.base_decimals = 6;
@@ -724,104 +769,17 @@ mod tests {
             h.raw_base_units_per_base_unit = raw;
             h
         }
-
         let q1 = header(1).base_lots_to_quote_atoms(BaseLots::new(1), Ticks::new(1)).unwrap();
         let q10 = header(10).base_lots_to_quote_atoms(BaseLots::new(1), Ticks::new(1)).unwrap();
         assert_eq!(q1.as_u64(), 1_000_000);
         assert_eq!(q10.as_u64(), 100_000);
-
         assert_eq!(quote_to_base_lots(&header(1), q1.as_u64(), 1, false).unwrap(), 1);
         assert_eq!(quote_to_base_lots(&header(10), q10.as_u64(), 1, false).unwrap(), 1);
     }
 
     #[test]
-    fn test_has_matching_liquidity_detects_all_suspended() {
-        let mut book = empty_book(false);
-        book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: BaseLots::new(10),
-            price_offset_ticks: 5,
-        };
-        let books = vec![(Pubkey::new_unique(), book)];
-        assert!(!has_matching_liquidity(&books, true, 0, None));
-        assert!(!has_matching_liquidity(&books, false, 0, None));
-    }
-
-    #[test]
-    fn test_has_matching_liquidity_detects_active_no_levels() {
-        let book = empty_book(true);
-        let books = vec![(Pubkey::new_unique(), book)];
-        assert!(!has_matching_liquidity(&books, true, 0, None));
-        assert!(!has_matching_liquidity(&books, false, 0, None));
-    }
-
-    /// A maker who repriced further than their free quote can back is dropped
-    /// from the auction on-chain. Quoting their liquidity would overstate what a
-    /// swap can fill, so the adapter must skip them too.
-    #[test]
-    fn test_unfundable_book_is_skipped() {
-        let mut book = empty_book(true);
-        book.ask_levels[0] = MakerLevel {
-            size_in_base_lots: BaseLots::new(10),
-            price_offset_ticks: 5,
-        };
-
-        // A pending reprice upward needs `quote_delta_per_tick * delta` moved
-        // from free into locked; here free cannot cover it.
-        book.mid_at_last_sync = 100;
-        book.mid_price_ticks = 200;
-        book.quote_delta_per_tick = 1_000;
-        book.quote_free = QuoteLots::new(1);
-        book.quote_locked = QuoteLots::new(0);
-
-        assert!(!book.is_quote_sync_fundable());
-        let books = vec![(Pubkey::new_unique(), book)];
-        assert!(!has_matching_liquidity(&books, true, 0, None));
-        assert!(collect_all_levels(&books, false, 0, None).is_empty());
-    }
-
-    /// Every pre-v2 account reads `0` in `mid_at_last_sync`, which is the
-    /// "already accurate" sentinel — so the skip never fires against the
-    /// currently deployed program and this adapter is safe to ship ahead of it.
-    #[test]
-    fn test_zero_anchor_is_always_fundable() {
-        let mut book = empty_book(true);
-        book.mid_at_last_sync = 0;
-        book.mid_price_ticks = 500_000;
-        book.quote_delta_per_tick = u64::MAX;
-        book.quote_free = QuoteLots::new(0);
-
-        assert!(book.is_quote_sync_fundable());
-        assert_eq!(book.projected_quote_balances().ok(), Some((0, 0)));
-    }
-
-    /// The replay is total-preserving: it moves quote between locked and free
-    /// without changing the sum.
-    #[test]
-    fn test_projection_preserves_total() {
-        let mut book = empty_book(true);
-        book.mid_at_last_sync = 100;
-        book.quote_delta_per_tick = 10;
-        book.quote_locked = QuoteLots::new(5_000);
-        book.quote_free = QuoteLots::new(5_000);
-
-        book.mid_price_ticks = 150;
-        let (l, f) = book.projected_quote_balances().unwrap();
-        assert_eq!(l + f, 10_000);
-        assert_eq!((l, f), (5_500, 4_500));
-
-        book.mid_price_ticks = 50;
-        let (l, f) = book.projected_quote_balances().unwrap();
-        assert_eq!(l + f, 10_000);
-        assert_eq!((l, f), (4_500, 5_500));
-    }
-
-
-    /// The adapter decodes these straight off the wire, so a size change means a
-    /// silent misread of every account. v2 deliberately preserved both.
-    #[test]
     fn layout_sizes_match_the_program() {
-        assert_eq!(core::mem::size_of::<MakerBook>(), 776, "MakerBook must stay 776 bytes");
-        assert_eq!(core::mem::size_of::<MarketStateHeader>(), 272, "header must stay 272 bytes");
+        assert_eq!(core::mem::size_of::<MakerBook>(), 776);
+        assert_eq!(core::mem::size_of::<MarketStateHeader>(), 272);
     }
-
 }

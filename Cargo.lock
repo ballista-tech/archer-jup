@@ -200,7 +200,7 @@ dependencies = [
 [[package]]
 name = "archer-sdk"
 version = "0.0.1"
-source = "git+https://github.com/ballista-tech/archer-sdk?rev=6d80857#6d80857cfa32105c0f91e73842527c8477187e9e"
+source = "git+https://github.com/ballista-tech/archer-sdk?rev=3286710#3286710669b4cb729cf3e09deb04cbe3d0b5dd9c"
 dependencies = [
  "borsh 1.6.1",
  "bytemuck",
@@ -548,7 +548,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115e54d64eb62cdebad391c19efc9dce4981c690c85a33a12199d99bb9546fee"
 dependencies = [
  "borsh-derive 0.10.4",
- "hashbrown 0.12.3",
+ "hashbrown 0.13.2",
 ]
 
 [[package]]
