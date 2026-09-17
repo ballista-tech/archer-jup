@@ -200,7 +200,7 @@ dependencies = [
 [[package]]
 name = "archer-sdk"
 version = "0.0.1"
-source = "git+https://github.com/ballista-tech/archer-sdk?rev=37d8ca9354405e500b0ac9c20520e12975f71892#37d8ca9354405e500b0ac9c20520e12975f71892"
+source = "git+https://github.com/ballista-tech/archer-sdk?rev=0d6a5557b4e5de5b4d74c4c31407096552cdd601#0d6a5557b4e5de5b4d74c4c31407096552cdd601"
 dependencies = [
  "borsh 1.6.1",
  "bytemuck",
