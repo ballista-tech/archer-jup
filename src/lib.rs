@@ -68,8 +68,8 @@ pub struct ArcherAmm {
 
     pub clock_ref: ClockRef,
 
-    /// Quote token account that receives the builder fee, when one is charged.
-    pub builder_fee_wallet: Pubkey,
+    /// Quote token account that receives the builder fee.
+    pub builder_fee_wallet: Option<Pubkey>,
 }
 
 impl ArcherAmm {
@@ -115,7 +115,7 @@ impl Amm for ArcherAmm {
             base_mint_data: vec![],
             quote_mint_data: vec![],
             clock_ref: amm_context.clock_ref.clone(),
-            builder_fee_wallet: Pubkey::default(),
+            builder_fee_wallet: None,
         })
     }
 
@@ -318,7 +318,7 @@ impl Amm for ArcherAmm {
         let mut account_metas = vec![
             AccountMeta::new_readonly(swap_params.token_transfer_authority, true),
             AccountMeta::new(self.market_key, false),
-            AccountMeta::new(self.builder_fee_wallet, false),
+            AccountMeta::new(self.builder_fee_wallet.unwrap_or(taker_quote_ata), false),
             AccountMeta::new_readonly(header.base_mint, false),
             AccountMeta::new_readonly(header.quote_mint, false),
             AccountMeta::new(header.base_vault, false),
