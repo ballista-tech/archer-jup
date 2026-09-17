@@ -103,17 +103,20 @@ fn engine_never_panics_on_adversarial_state() {
         let slot = edge_u64(&mut rng);
         let is_buy = rng.random_bool(0.5);
         let taker = if rng.random_bool(0.3) { Some(books.first().map(|(_, b)| b.maker).unwrap_or_default()) } else { None };
+        let started = std::time::Instant::now();
         let r = catch_unwind(AssertUnwindSafe(|| {
             compute_quote(amount, is_buy, &header, &books, slot, taker.as_ref())
         }));
         assert!(r.is_ok(), "engine panicked: buy={is_buy} amount={amount} books={n}");
+        assert!(started.elapsed().as_secs() < 2, "engine took {:?}: buy={is_buy} amount={amount} books={n}", started.elapsed());
     }
 }
 
 #[test]
 fn amm_lifecycle_never_panics_on_garbage_accounts() {
-    let mut rng = StdRng::seed_from_u64(0x5A5A);
     let ctx = AmmContext { clock_ref: Default::default() };
+    for seed in [0x5A5Au64, 0xC0FFEE, 0xBEEF] {
+    let mut rng = StdRng::seed_from_u64(seed);
     for round in 0..600 {
         let market = Pubkey::new_unique();
         let header = random_header(&mut rng);
@@ -167,6 +170,7 @@ fn amm_lifecycle_never_panics_on_garbage_accounts() {
             map.insert(*k, Account { lamports: 1, data, owner: ARCHER_PROGRAM_ID, executable: false, rent_epoch: 0 });
         }
 
+        let started = std::time::Instant::now();
         let r = catch_unwind(AssertUnwindSafe(|| {
             for _ in 0..2 {
                 let _ = amm.update(map.clone());
@@ -207,5 +211,7 @@ fn amm_lifecycle_never_panics_on_garbage_accounts() {
             }
         }));
         assert!(r.is_ok(), "adapter panicked in round {round}");
+        assert!(started.elapsed().as_secs() < 5, "round {round} took {:?}", started.elapsed());
+    }
     }
 }

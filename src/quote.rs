@@ -10,6 +10,18 @@ struct AggregatedLevel {
     maker_index: usize,
 }
 
+/// Every pass over a price either exhausts one maker's level there or is the
+/// last pass at that price (it clears the pro-rata dust), so a quote needs at
+/// most one pass per level entry plus one per distinct price. Any geometry
+/// that needs more is one where a pass moves neither base nor quote, which
+/// the program's lot and tick validation rules out; on corrupt state the
+/// quote refuses instead of spinning.
+fn max_fill_passes(levels: &[AggregatedLevel]) -> Result<u32, ArcherAmmError> {
+    let distinct_prices = levels.windows(2).filter(|w| w[0].price_ticks != w[1].price_ticks).count() + usize::from(!levels.is_empty());
+    u32::try_from(levels.len() + distinct_prices)
+        .map_err(|_| ArcherAmmError::MathError("level count overflow".into()))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct QuoteOutput {
     pub out_amount: u64,
@@ -106,6 +118,8 @@ fn quote_buy_exact_in(
     let mut total_base_lots_out = 0u64;
     let mut total_quote_lots_matched = 0u64;
 
+    let max_passes = max_fill_passes(&all_asks)?;
+    let mut passes: u32 = 0;
     let mut i = 0;
     while i < all_asks.len() && remaining_quote_lots > 0 {
         let price = all_asks[i].price_ticks;
@@ -119,6 +133,10 @@ fn quote_buy_exact_in(
         };
         let mut budget_exhausted = false;
         loop {
+            passes = passes
+                .checked_add(1)
+                .filter(|p| *p <= max_passes)
+                .ok_or_else(|| ArcherAmmError::MathError("fill count exceeds the resting levels".into()))?;
             let total_size = group_total(&all_asks[i..group_end])?;
             if total_size == 0 {
                 break;
@@ -202,6 +220,8 @@ fn quote_sell_exact_in(
     let mut remaining_base_lots = input_base_lots;
     let mut total_quote_lots_matched = 0u64;
 
+    let max_passes = max_fill_passes(&all_bids)?;
+    let mut passes: u32 = 0;
     let mut i = 0;
     while i < all_bids.len() && remaining_base_lots > 0 {
         let price = all_bids[i].price_ticks;
@@ -215,6 +235,10 @@ fn quote_sell_exact_in(
         };
 
         loop {
+            passes = passes
+                .checked_add(1)
+                .filter(|p| *p <= max_passes)
+                .ok_or_else(|| ArcherAmmError::MathError("fill count exceeds the resting levels".into()))?;
             let total_size = group_total(&all_bids[i..group_end])?;
             if total_size == 0 {
                 break;
@@ -775,6 +799,32 @@ mod tests {
         assert_eq!(q10.as_u64(), 100_000);
         assert_eq!(quote_to_base_lots(&header(1), q1.as_u64(), 1, false).unwrap(), 1);
         assert_eq!(quote_to_base_lots(&header(10), q10.as_u64(), 1, false).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_zero_cost_passes_are_bounded_not_spun() {
+        let mut h = MarketStateHeader::zeroed();
+        h.base_decimals = 35;
+        h.quote_decimals = 35;
+        h.base_atoms_per_base_lot = BaseAtomsPerLot::new(1);
+        h.quote_atoms_per_quote_lot = QuoteAtomsPerLot::new(1);
+        h.tick_size_in_quote_atoms_per_base_unit = QuoteAtomsPerBaseUnitPerTick::new(u64::MAX - 1);
+        h.raw_base_units_per_base_unit = 1;
+        let mut b = empty_book(true);
+        b.mid_price_ticks = 0;
+        b.tick_conversion_num = 1;
+        b.tick_conversion_den = 1;
+        b.ask_levels[0] = MakerLevel::new(BaseLots::new(u64::MAX / 2), 933_341);
+        b.base_locked = BaseLots::new(u64::MAX / 2);
+        let books = vec![(Pubkey::new_unique(), b)];
+
+        let started = std::time::Instant::now();
+        let result = compute_quote(1, true, &h, &books, 0, None);
+        assert!(started.elapsed().as_millis() < 500, "quote must refuse quickly, took {:?}", started.elapsed());
+        assert!(
+            matches!(&result, Err(e) if format!("{e}").contains("fill count")),
+            "expected the pass bound to refuse, got {result:?}"
+        );
     }
 
     #[test]
